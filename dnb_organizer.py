@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║          DnB Music Library Organizer  v1.3                   ║
-║   Organizes MP3 / WAV / FLAC / M4A files by Label → Artist  ║
+║          DnB Music Library Organizer  v1.5                   ║
+║   Organizes MP3 / WAV / FLAC / M4A files by Genre → Label   ║
 ╚══════════════════════════════════════════════════════════════╝
 
 Dependencies:
@@ -9,23 +9,24 @@ Dependencies:
 
 Usage:
     python dnb_organizer.py
-    (You will be prompted for Source and Destination directories,
-     and optionally a Discogs personal access token.)
+    (You will be prompted for Source, Destination, and optional
+     Discogs token.)
 
-Online label lookup order (when tag is missing):
-    1. MusicBrainz  — free, no key needed
-    2. Beatport     — free, no key needed (parses search page JSON)
-    3. Discogs      — free token required (discogs.com → Settings → Developers)
+Output structure:
+    [Genre] / [Label] / [Artist] / [Artist] - [Title].ext
+
+Online metadata lookup order (label + genre, when tags are missing):
+    1. Beatport      — free, no key (sub_genre from __NEXT_DATA__ JSON)
+    2. MusicBrainz   — free, no key
+    3. Discogs       — free token required (discogs.com → Settings → Developers)
 """
 
-import os
 import re
 import json
 import time
 import shutil
 import urllib.request
 import urllib.parse
-import urllib.error
 from pathlib import Path
 
 from mutagen import File as MutagenFile
@@ -40,25 +41,24 @@ ILLEGAL_CHARS_RE = re.compile(r'[\\/:*?"<>|]')
 
 UNKNOWN_LABEL  = "_Unknown Label"
 UNKNOWN_ARTIST = "_Unknown Artist"
+UNKNOWN_GENRE  = "_Unknown Genre"
 
-# MusicBrainz requires at least 1 second between requests
 MB_RATE_LIMIT      = 1.1
-MB_USER_AGENT      = "dnb-organizer/1.2 ( https://github.com/davyvs/dnb-organizer )"
-
+MB_USER_AGENT      = "dnb-organizer/1.5 ( https://github.com/davyvs/dnb-organizer )"
 DISCOGS_RATE_LIMIT  = 1.1
-BEATPORT_RATE_LIMIT = 2.0   # be polite — no official API
+BEATPORT_RATE_LIMIT = 2.0
 
 
 # ─── Online Lookup Cache & Rate Limiter ───────────────────────────────────────
 
-_label_cache: dict  = {}   # (artist, title) → label string
-_last_mb_call: list = [0.0]
-_last_dg_call: list = [0.0]
-_last_bp_call: list = [0.0]
+# Cache stores {"label": str, "genre": str} keyed by (artist, title)
+_online_cache: dict  = {}
+_last_mb_call: list  = [0.0]
+_last_dg_call: list  = [0.0]
+_last_bp_call: list  = [0.0]
 
 
 def _rate_limit(last_call_ref: list, interval: float) -> None:
-    """Block until `interval` seconds have passed since the last call."""
     elapsed = time.time() - last_call_ref[0]
     if elapsed < interval:
         time.sleep(interval - elapsed)
@@ -66,7 +66,6 @@ def _rate_limit(last_call_ref: list, interval: float) -> None:
 
 
 def _http_get(url: str, headers: dict) -> dict | None:
-    """Perform a GET request and return parsed JSON, or None on failure."""
     req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=8) as resp:
@@ -76,7 +75,6 @@ def _http_get(url: str, headers: dict) -> dict | None:
 
 
 def _http_get_html(url: str, headers: dict) -> str:
-    """Perform a GET request and return the raw HTML string, or '' on failure."""
     req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -87,130 +85,29 @@ def _http_get_html(url: str, headers: dict) -> str:
 
 # ─── Search Query Helpers ─────────────────────────────────────────────────────
 
-# Strips "(feat. X)", "[feat. X]", "ft. X" etc. from titles before searching
-_FEAT_RE = re.compile(
-    r"\s*[\(\[]\s*(?:feat|ft|featuring)\.?\s+[^\)\]]+[\)\]]",
-    re.IGNORECASE,
-)
-# Strips leading track-number prefixes like "34 " or "03. "
+_FEAT_RE     = re.compile(r"\s*[\(\[]\s*(?:feat|ft|featuring)\.?\s+[^\)\]]+[\)\]]", re.IGNORECASE)
 _TRACKNUM_RE = re.compile(r"^\d{1,3}[.\s]+")
 
 
 def clean_search_title(title: str) -> str:
-    """Return a simplified title better suited for database searches."""
     t = _TRACKNUM_RE.sub("", title).strip()
     t = _FEAT_RE.sub("", t).strip()
     return t
 
 
 def search_variants(artist: str, title: str):
-    """
-    Yield (artist, title) pairs from most specific to least specific.
-    Tries clean title + artist, then clean title alone.
-    """
+    """Yield (artist, title) pairs from most to least specific."""
     clean = clean_search_title(title)
-    # Full: cleaned title + artist
     if clean and artist:
         yield artist, clean
-    # Clean title only (catches multi-artist releases where name differs)
     if clean and clean != title:
-        yield artist, title          # original title + artist
-    # Title-only fallback (useful when artist name varies on the release)
+        yield artist, title
     if clean:
         yield "", clean
 
 
-# ─── MusicBrainz Lookup ───────────────────────────────────────────────────────
-
-def _mb_query(artist: str, title: str) -> str:
-    """Run a single MusicBrainz recording search and return a label or ''."""
-    _rate_limit(_last_mb_call, MB_RATE_LIMIT)
-
-    query_parts = []
-    if title:
-        query_parts.append(f'recording:"{title}"')
-    if artist:
-        query_parts.append(f'artist:"{artist}"')
-    if not query_parts:
-        return ""
-
-    query = " AND ".join(query_parts)
-    url = (
-        "https://musicbrainz.org/ws/2/recording/?"
-        + urllib.parse.urlencode({"query": query, "fmt": "json", "limit": "5"})
-    )
-
-    data = _http_get(url, {"User-Agent": MB_USER_AGENT, "Accept": "application/json"})
-    if not data:
-        return ""
-
-    for recording in data.get("recordings", []):
-        for release in recording.get("releases", []):
-            for label_info in release.get("label-info", []):
-                name = label_info.get("label", {}).get("name", "").strip()
-                if name and name.lower() not in ("self-released", "not on label"):
-                    return name
-    return ""
-
-
-def lookup_label_musicbrainz(artist: str, title: str) -> str:
-    """
-    Search MusicBrainz with multiple query variants (clean title, feat-stripped,
-    title-only) to maximise hit rate on underground/newer DnB tracks.
-    """
-    for a, t in search_variants(artist, title):
-        label = _mb_query(a, t)
-        if label:
-            return label
-    return ""
-
-
-# ─── Discogs Lookup ───────────────────────────────────────────────────────────
-
-def _dg_query(artist: str, title: str, token: str) -> str:
-    """Run a single Discogs search and return a label or ''."""
-    _rate_limit(_last_dg_call, DISCOGS_RATE_LIMIT)
-
-    params = {"type": "release", "token": token, "per_page": "5"}
-    if title:
-        params["q"] = title
-    if artist:
-        params["artist"] = artist
-
-    url = "https://api.discogs.com/database/search?" + urllib.parse.urlencode(params)
-
-    data = _http_get(
-        url,
-        {
-            "User-Agent": MB_USER_AGENT,
-            "Authorization": f"Discogs token={token}",
-        },
-    )
-    if not data:
-        return ""
-
-    for result in data.get("results", []):
-        labels = result.get("label", [])
-        if labels:
-            return labels[0].strip()
-    return ""
-
-
-def lookup_label_discogs(artist: str, title: str, token: str) -> str:
-    """
-    Search Discogs with multiple query variants to improve hit rate.
-    Requires a Discogs personal access token.
-    """
-    for a, t in search_variants(artist, title):
-        label = _dg_query(a, t, token)
-        if label:
-            return label
-    return ""
-
-
 # ─── Beatport Lookup ──────────────────────────────────────────────────────────
 
-# Regex to pull the __NEXT_DATA__ JSON blob Beatport embeds in every page
 _NEXT_DATA_RE = re.compile(
     r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
     re.DOTALL,
@@ -227,15 +124,19 @@ _BEATPORT_HEADERS = {
 }
 
 
-def _extract_beatport_label(data: dict) -> str:
+def _extract_beatport_data(data: dict) -> dict:
     """
-    Walk the nested __NEXT_DATA__ structure Beatport uses and return the
-    first label name found in the track search results.
+    Walk Beatport's __NEXT_DATA__ and return the first result's label and genre.
 
-    Beatport's Next.js data nests results under:
+    Beatport nests results under:
       props → pageProps → dehydratedState → queries → [*] → state → data → results
-    Each result may have a 'label' key with a 'name' field.
+
+    Genre priority:
+      sub_genre.name  (e.g. "Neurofunk", "Liquid", "Jump Up")
+      genre.name      (e.g. "Drum & Bass") — only used if sub_genre is absent
+                       or is just "Drum & Bass" (too broad to be useful)
     """
+    result = {"label": "", "genre": ""}
     try:
         queries = (
             data.get("props", {})
@@ -249,139 +150,274 @@ def _extract_beatport_label(data: dict) -> str:
                      .get("data", {})
                      .get("results", [])
             )
-            for result in results:
-                # Tracks have a direct 'label' dict
-                label = result.get("label", {})
-                if isinstance(label, dict):
-                    name = label.get("name", "").strip()
-                    if name:
-                        return name
-                # Some result shapes nest it under 'release'
-                release = result.get("release", {})
-                if isinstance(release, dict):
-                    label = release.get("label", {})
+            for track in results:
+                # ── Label ─────────────────────────────────────────────────
+                if not result["label"]:
+                    label = track.get("label", {})
                     if isinstance(label, dict):
-                        name = label.get("name", "").strip()
-                        if name:
-                            return name
+                        result["label"] = label.get("name", "").strip()
+                    if not result["label"]:
+                        release = track.get("release", {})
+                        if isinstance(release, dict):
+                            lbl = release.get("label", {})
+                            if isinstance(lbl, dict):
+                                result["label"] = lbl.get("name", "").strip()
+
+                # ── Genre ─────────────────────────────────────────────────
+                if not result["genre"]:
+                    sub = track.get("sub_genre", {})
+                    if isinstance(sub, dict):
+                        name = sub.get("name", "").strip()
+                        # sub_genre "Drum & Bass" is too broad — skip it
+                        if name and "drum" not in name.lower():
+                            result["genre"] = name
+
+                    # Fall back to top-level genre if sub_genre wasn't useful
+                    if not result["genre"]:
+                        top = track.get("genre", {})
+                        if isinstance(top, dict):
+                            result["genre"] = top.get("name", "").strip()
+
+                if result["label"] and result["genre"]:
+                    return result
+
     except Exception:
         pass
-    return ""
+    return result
 
 
-def _bp_query(artist: str, title: str) -> str:
-    """Run a single Beatport search and return a label or ''."""
+def _bp_query(artist: str, title: str) -> dict:
+    """Fetch a Beatport search page and return {"label": str, "genre": str}."""
     _rate_limit(_last_bp_call, BEATPORT_RATE_LIMIT)
 
     query = " ".join(filter(None, [artist, title])).strip()
     if not query:
-        return ""
+        return {"label": "", "genre": ""}
 
-    url = (
-        "https://www.beatport.com/search/tracks?"
-        + urllib.parse.urlencode({"q": query})
-    )
-
+    url = "https://www.beatport.com/search/tracks?" + urllib.parse.urlencode({"q": query})
     html = _http_get_html(url, _BEATPORT_HEADERS)
     if not html:
-        return ""
+        return {"label": "", "genre": ""}
 
     match = _NEXT_DATA_RE.search(html)
     if not match:
-        return ""
+        return {"label": "", "genre": ""}
 
     try:
         data = json.loads(match.group(1))
     except json.JSONDecodeError:
-        return ""
+        return {"label": "", "genre": ""}
 
-    return _extract_beatport_label(data)
+    return _extract_beatport_data(data)
 
 
-def lookup_label_beatport(artist: str, title: str) -> str:
-    """
-    Search Beatport with multiple query variants to improve hit rate.
-    Tries clean title + artist first, then progressively broader queries.
-    Parses the __NEXT_DATA__ JSON embedded in Beatport's search page.
-    No API key required.
-    """
+def lookup_beatport(artist: str, title: str) -> dict:
+    """Try multiple query variants on Beatport; return best {"label", "genre"}."""
+    best = {"label": "", "genre": ""}
     for a, t in search_variants(artist, title):
-        label = _bp_query(a, t)
-        if label:
-            return label
-    return ""
+        result = _bp_query(a, t)
+        if result["label"] and not best["label"]:
+            best["label"] = result["label"]
+        if result["genre"] and not best["genre"]:
+            best["genre"] = result["genre"]
+        if best["label"] and best["genre"]:
+            break
+    return best
+
+
+# ─── MusicBrainz Lookup ───────────────────────────────────────────────────────
+
+def _mb_query(artist: str, title: str) -> dict:
+    """Run a MusicBrainz search; return {"label": str, "genre": str}."""
+    _rate_limit(_last_mb_call, MB_RATE_LIMIT)
+
+    query_parts = []
+    if title:
+        query_parts.append(f'recording:"{title}"')
+    if artist:
+        query_parts.append(f'artist:"{artist}"')
+    if not query_parts:
+        return {"label": "", "genre": ""}
+
+    query = " AND ".join(query_parts)
+    url = (
+        "https://musicbrainz.org/ws/2/recording/?"
+        + urllib.parse.urlencode({
+            "query": query, "fmt": "json", "limit": "5",
+            "inc": "genres+tags+releases+label-info",
+        })
+    )
+
+    data = _http_get(url, {"User-Agent": MB_USER_AGENT, "Accept": "application/json"})
+    if not data:
+        return {"label": "", "genre": ""}
+
+    result = {"label": "", "genre": ""}
+
+    for recording in data.get("recordings", []):
+        # Genre: from the recording's genre/tag list
+        if not result["genre"]:
+            genres = recording.get("genres", []) or recording.get("tags", [])
+            # Sort by count descending (most voted first)
+            genres_sorted = sorted(genres, key=lambda g: g.get("count", 0), reverse=True)
+            for g in genres_sorted:
+                name = g.get("name", "").strip()
+                if name and name.lower() not in ("drum and bass", "drum & bass", "dnb", ""):
+                    result["genre"] = name.title()
+                    break
+
+        # Label: from releases
+        if not result["label"]:
+            for release in recording.get("releases", []):
+                for label_info in release.get("label-info", []):
+                    name = label_info.get("label", {}).get("name", "").strip()
+                    if name and name.lower() not in ("self-released", "not on label"):
+                        result["label"] = name
+                        break
+                if result["label"]:
+                    break
+
+        if result["label"] and result["genre"]:
+            break
+
+    return result
+
+
+def lookup_musicbrainz(artist: str, title: str) -> dict:
+    """Try multiple query variants on MusicBrainz."""
+    best = {"label": "", "genre": ""}
+    for a, t in search_variants(artist, title):
+        result = _mb_query(a, t)
+        if result["label"] and not best["label"]:
+            best["label"] = result["label"]
+        if result["genre"] and not best["genre"]:
+            best["genre"] = result["genre"]
+        if best["label"] and best["genre"]:
+            break
+    return best
+
+
+# ─── Discogs Lookup ───────────────────────────────────────────────────────────
+
+def _dg_query(artist: str, title: str, token: str) -> dict:
+    """Run a Discogs search; return {"label": str, "genre": str}."""
+    _rate_limit(_last_dg_call, DISCOGS_RATE_LIMIT)
+
+    params = {"type": "release", "token": token, "per_page": "5"}
+    if title:
+        params["q"] = title
+    if artist:
+        params["artist"] = artist
+
+    url = "https://api.discogs.com/database/search?" + urllib.parse.urlencode(params)
+    data = _http_get(url, {
+        "User-Agent": MB_USER_AGENT,
+        "Authorization": f"Discogs token={token}",
+    })
+    if not data:
+        return {"label": "", "genre": ""}
+
+    result = {"label": "", "genre": ""}
+    for r in data.get("results", []):
+        if not result["label"]:
+            labels = r.get("label", [])
+            if labels:
+                result["label"] = labels[0].strip()
+        if not result["genre"]:
+            # Discogs 'style' is more specific than 'genre' for DnB
+            styles = r.get("style", [])
+            genres = r.get("genre", [])
+            candidates = styles or genres
+            for s in candidates:
+                if s.lower() not in ("electronic", "drum n bass", "drum & bass", "dnb"):
+                    result["genre"] = s.strip()
+                    break
+        if result["label"] and result["genre"]:
+            break
+    return result
+
+
+def lookup_discogs(artist: str, title: str, token: str) -> dict:
+    """Try multiple query variants on Discogs."""
+    best = {"label": "", "genre": ""}
+    for a, t in search_variants(artist, title):
+        result = _dg_query(a, t, token)
+        if result["label"] and not best["label"]:
+            best["label"] = result["label"]
+        if result["genre"] and not best["genre"]:
+            best["genre"] = result["genre"]
+        if best["label"] and best["genre"]:
+            break
+    return best
 
 
 # ─── Combined Online Lookup ───────────────────────────────────────────────────
 
-def lookup_label_online(
+def lookup_online(
     artist: str,
     title: str,
     discogs_token: str = "",
     use_beatport: bool = True,
-) -> str:
+) -> dict:
     """
-    Label lookup chain (stops as soon as a result is found):
-        1. MusicBrainz  — free, no key
-        2. Beatport     — free, no key (parses search page)
-        3. Discogs      — free token required
+    Return {"label": str, "genre": str} by querying sources in order:
+        1. Beatport     — label + sub_genre from same page fetch
+        2. MusicBrainz  — label + community genre tags
+        3. Discogs      — label + style tags (token required)
 
-    Results are cached so the same (artist, title) is never looked up twice.
-    Returns a label string, or '' if nothing is found.
+    Results are cached. Each source fills in whichever fields are still
+    empty, so a partial Beatport hit (label only) will still try MusicBrainz
+    for the genre.
     """
     cache_key = (artist.lower().strip(), title.lower().strip())
-    if cache_key in _label_cache:
-        return _label_cache[cache_key]
+    if cache_key in _online_cache:
+        return _online_cache[cache_key]
 
-    label = ""
+    best = {"label": "", "genre": ""}
 
-    # 1 — MusicBrainz
-    if not label and (artist or title):
+    def _merge(result: dict) -> None:
+        if result["label"] and not best["label"]:
+            best["label"] = result["label"]
+        if result["genre"] and not best["genre"]:
+            best["genre"] = result["genre"]
+
+    # 1 — Beatport (gives both in one fetch)
+    if use_beatport and (artist or title):
         try:
-            label = lookup_label_musicbrainz(artist, title)
+            _merge(lookup_beatport(artist, title))
         except Exception:
-            label = ""
+            pass
 
-    # 2 — Beatport
-    if not label and use_beatport and (artist or title):
+    # 2 — MusicBrainz (fill in whatever's still missing)
+    if (not best["label"] or not best["genre"]) and (artist or title):
         try:
-            label = lookup_label_beatport(artist, title)
+            _merge(lookup_musicbrainz(artist, title))
         except Exception:
-            label = ""
+            pass
 
     # 3 — Discogs
-    if not label and discogs_token and (artist or title):
+    if (not best["label"] or not best["genre"]) and discogs_token and (artist or title):
         try:
-            label = lookup_label_discogs(artist, title, discogs_token)
+            _merge(lookup_discogs(artist, title, discogs_token))
         except Exception:
-            label = ""
+            pass
 
-    _label_cache[cache_key] = label
-    return label
+    _online_cache[cache_key] = best
+    return best
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def sanitize(name: str) -> str:
-    """
-    Replace illegal filesystem characters with a space (preserving word
-    boundaries, e.g. 'Hospital/Records' → 'Hospital Records') then collapse
-    any runs of whitespace and strip the result.
-    """
     replaced = ILLEGAL_CHARS_RE.sub(" ", name)
     return re.sub(r"\s+", " ", replaced).strip()
 
 
 def title_case(name: str) -> str:
-    """Convert a string to Title Case."""
     return name.title()
 
 
 def clean_folder_name(raw: str, fallback: str) -> str:
-    """
-    Return a clean, Title-Cased folder name.
-    Falls back to `fallback` if `raw` is empty after cleaning.
-    """
     cleaned = sanitize(raw).strip()
     if not cleaned:
         return fallback
@@ -389,20 +425,10 @@ def clean_folder_name(raw: str, fallback: str) -> str:
 
 
 def unique_destination(dest_path: Path) -> Path:
-    """
-    If `dest_path` already exists, append an incrementing number before the
-    extension until a free name is found.
-
-    Example:  Artist - Track.mp3  →  Artist - Track (2).mp3
-    """
     if not dest_path.exists():
         return dest_path
-
-    stem   = dest_path.stem
-    suffix = dest_path.suffix
-    parent = dest_path.parent
+    stem, suffix, parent = dest_path.stem, dest_path.suffix, dest_path.parent
     counter = 2
-
     while True:
         candidate = parent / f"{stem} ({counter}){suffix}"
         if not candidate.exists():
@@ -411,11 +437,6 @@ def unique_destination(dest_path: Path) -> Path:
 
 
 def extract_tag(audio, *keys: str) -> str:
-    """
-    Try multiple tag key names and return the first non-empty string found.
-    Handles both dict-style (MP3/ID3) and list-style (FLAC/Vorbis) tag values.
-    Returns an empty string if nothing is found.
-    """
     for key in keys:
         try:
             value = audio.get(key)
@@ -435,40 +456,32 @@ def extract_tag(audio, *keys: str) -> str:
 
 
 def read_metadata(filepath: Path) -> dict:
-    """
-    Return a dict with 'artist', 'label', and 'title' extracted from the file.
-    Gracefully handles unreadable or tag-less files.
-    """
-    result = {"artist": "", "label": "", "title": ""}
+    """Return artist, label, title, and genre from the file's embedded tags."""
+    result = {"artist": "", "label": "", "title": "", "genre": ""}
 
     try:
         audio = MutagenFile(filepath, easy=True)
         if audio is None:
             return result
 
-        result["artist"] = extract_tag(
-            audio,
-            "artist",                        # EasyID3 / EasyMP4 / Vorbis
-            "TPE1",                          # Raw ID3
-            "©ART",                          # Raw MP4
-        )
-        result["label"] = extract_tag(
-            audio,
-            "organization",                  # EasyID3 → TPUB
-            "label",                         # Vorbis (FLAC)
-            "publisher",                     # Some taggers
-            "TPUB",                          # Raw ID3
-            "----:com.apple.iTunes:LABEL",   # iTunes M4A freeform atom
+        result["artist"] = extract_tag(audio,
+            "artist", "TPE1", "©ART")
+
+        result["label"] = extract_tag(audio,
+            "organization", "label", "publisher", "TPUB",
+            "----:com.apple.iTunes:LABEL",
             "----:com.apple.iTunes:label",
             "----:com.apple.iTunes:Publisher",
-            "----:com.apple.iTunes:publisher",
-        )
-        result["title"] = extract_tag(
-            audio,
-            "title",                         # EasyID3 / EasyMP4 / Vorbis
-            "TIT2",                          # Raw ID3
-            "©nam",                          # Raw MP4
-        )
+            "----:com.apple.iTunes:publisher")
+
+        result["title"] = extract_tag(audio,
+            "title", "TIT2", "©nam")
+
+        result["genre"] = extract_tag(audio,
+            "genre",                           # EasyID3 / Vorbis / EasyMP4
+            "TCON",                            # Raw ID3
+            "©gen",                            # Raw MP4
+            "----:com.apple.iTunes:GENRE")
 
     except (ID3NoHeaderError, Exception):
         pass
@@ -477,10 +490,6 @@ def read_metadata(filepath: Path) -> dict:
 
 
 def build_filename(artist_folder: str, title: str, ext: str) -> str | None:
-    """
-    Build the destination filename:  'Artist - Track Title.ext'
-    Returns None if title is missing (caller uses original stem).
-    """
     clean_title = sanitize(title).strip()
     if clean_title:
         return f"{artist_folder} - {title_case(clean_title)}{ext}"
@@ -497,12 +506,11 @@ def organize_library(
     use_beatport: bool = True,
 ) -> None:
     """
-    Walk `source_dir` recursively, read metadata from every supported audio
-    file, and move it into:
-        dest_dir / [Label] / [Artist] / [Artist] - [Title].ext
+    Walk source_dir recursively and move each audio file into:
+        dest_dir / [Genre] / [Label] / [Artist] / [Artist] - [Title].ext
 
-    When the Label tag is empty, queries MusicBrainz (and optionally Discogs)
-    to fill it in before falling back to _Unknown Label.
+    Missing label and genre tags are resolved via online lookup before
+    falling back to _Unknown Label / _Unknown Genre.
     """
     files_moved   = 0
     files_skipped = 0
@@ -526,31 +534,40 @@ def organize_library(
 
         try:
             meta = read_metadata(filepath)
+            needs_lookup = use_online and (meta["artist"] or meta["title"])
+            needs_label  = not meta["label"]
+            needs_genre  = not meta["genre"]
 
-            # ── Online label lookup when tag is missing ───────────────────
-            if not meta["label"] and use_online and (meta["artist"] or meta["title"]):
-                print("  🔍 looking up label…", end="", flush=True)
-                found = lookup_label_online(
+            # ── Online lookup when label or genre is missing ───────────────
+            if needs_lookup and (needs_label or needs_genre):
+                print("  🔍", end="", flush=True)
+                found = lookup_online(
                     meta["artist"], meta["title"], discogs_token, use_beatport
                 )
-                if found:
-                    meta["label"] = found
-                    print(f" found: {found}", end="", flush=True)
-                else:
-                    print("  not found", end="", flush=True)
+                if needs_label and found["label"]:
+                    meta["label"] = found["label"]
+                    print(f" label:{found['label']}", end="", flush=True)
+                if needs_genre and found["genre"]:
+                    meta["genre"] = found["genre"]
+                    print(f" genre:{found['genre']}", end="", flush=True)
+                if (needs_label and not meta["label"]) or (needs_genre and not meta["genre"]):
+                    missing = []
+                    if needs_label and not meta["label"]: missing.append("label")
+                    if needs_genre and not meta["genre"]: missing.append("genre")
+                    print(f"  [{'/'.join(missing)} not found]", end="", flush=True)
 
             print("  →  ", end="", flush=True)
 
+            genre_folder  = clean_folder_name(meta["genre"],  UNKNOWN_GENRE)
             label_folder  = clean_folder_name(meta["label"],  UNKNOWN_LABEL)
             artist_folder = clean_folder_name(meta["artist"], UNKNOWN_ARTIST)
             ext           = filepath.suffix.lower()
 
             filename = build_filename(artist_folder, meta["title"], ext)
             if filename is None:
-                original_stem = title_case(sanitize(filepath.stem))
-                filename = f"{original_stem}{ext}"
+                filename = f"{title_case(sanitize(filepath.stem))}{ext}"
 
-            target_dir = dest_dir / label_folder / artist_folder
+            target_dir = dest_dir / genre_folder / label_folder / artist_folder
             target_dir.mkdir(parents=True, exist_ok=True)
 
             dest_file = unique_destination(target_dir / filename)
@@ -563,7 +580,6 @@ def organize_library(
             errors.append((filepath, str(exc)))
             files_skipped += 1
 
-    # ── Summary ───────────────────────────────────────────────────────────
     print("\n" + "─" * 60)
     print(f"  ✔  Moved   : {files_moved}")
     print(f"  ✖  Skipped : {files_skipped}")
@@ -578,10 +594,6 @@ def organize_library(
 # ─── Entry Point ──────────────────────────────────────────────────────────────
 
 def prompt_directory(prompt_text: str) -> Path:
-    """
-    Prompt for a directory path. Uses Path directly without resolve() so
-    that UNC paths (\\NAS\share) and mapped drives work on Windows.
-    """
     while True:
         raw = input(prompt_text).strip().strip('"').strip("'")
         if not raw:
@@ -600,17 +612,16 @@ def prompt_directory(prompt_text: str) -> Path:
 def main() -> None:
     print()
     print("╔══════════════════════════════════════════════════════════════╗")
-    print("║          DnB Music Library Organizer  v1.3                   ║")
+    print("║          DnB Music Library Organizer  v1.5                   ║")
     print("╚══════════════════════════════════════════════════════════════╝")
     print()
     print("  Supported formats : MP3 · WAV · FLAC · M4A · AIFF")
-    print("  Output structure  : [Label] / [Artist] / [Artist] - [Title].ext")
+    print("  Output structure  : [Genre] / [Label] / [Artist] / [Artist] - [Title].ext")
     print()
 
     # ── Online lookup setup ───────────────────────────────────────────────
-    print("  ── Online label lookup (for files missing a Label tag) ──────")
-    print("  Lookup order: MusicBrainz → Beatport → Discogs")
-    print("  MusicBrainz and Beatport are free with no key needed.")
+    print("  ── Online metadata lookup (label + genre) ───────────────────")
+    print("  Sources: Beatport (sub_genre) → MusicBrainz → Discogs")
     print()
 
     use_online_raw = input("  Enable online lookup? [Y/n]  ").strip().lower()
@@ -631,12 +642,12 @@ def main() -> None:
         print()
         sources = ["MusicBrainz"]
         if use_beatport:
-            sources.append("Beatport")
+            sources.insert(0, "Beatport")
         if discogs_token:
             sources.append("Discogs")
-        print(f"  ✔  Online sources enabled: {' → '.join(sources)}")
+        print(f"  ✔  Online sources: {' → '.join(sources)}")
     else:
-        print("  ℹ  Online lookup disabled.")
+        print("  ℹ  Online lookup disabled — using file tags only.")
     print()
 
     # ── Directories ───────────────────────────────────────────────────────
@@ -645,7 +656,7 @@ def main() -> None:
 
     print(f"\n  Source      : {source_dir}")
     print(f"  Destination : {dest_dir}")
-    print(f"  Online lookup: {'MusicBrainz' + (' + Discogs' if discogs_token else '')  if use_online else 'disabled'}")
+    print(f"  Structure   : Genre / Label / Artist / Track")
 
     confirm = input("\n  Proceed? [y/N]  ").strip().lower()
     if confirm not in ("y", "yes"):
