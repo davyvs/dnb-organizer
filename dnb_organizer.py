@@ -85,13 +85,45 @@ def _http_get_html(url: str, headers: dict) -> str:
         return ""
 
 
+# ─── Search Query Helpers ─────────────────────────────────────────────────────
+
+# Strips "(feat. X)", "[feat. X]", "ft. X" etc. from titles before searching
+_FEAT_RE = re.compile(
+    r"\s*[\(\[]\s*(?:feat|ft|featuring)\.?\s+[^\)\]]+[\)\]]",
+    re.IGNORECASE,
+)
+# Strips leading track-number prefixes like "34 " or "03. "
+_TRACKNUM_RE = re.compile(r"^\d{1,3}[.\s]+")
+
+
+def clean_search_title(title: str) -> str:
+    """Return a simplified title better suited for database searches."""
+    t = _TRACKNUM_RE.sub("", title).strip()
+    t = _FEAT_RE.sub("", t).strip()
+    return t
+
+
+def search_variants(artist: str, title: str):
+    """
+    Yield (artist, title) pairs from most specific to least specific.
+    Tries clean title + artist, then clean title alone.
+    """
+    clean = clean_search_title(title)
+    # Full: cleaned title + artist
+    if clean and artist:
+        yield artist, clean
+    # Clean title only (catches multi-artist releases where name differs)
+    if clean and clean != title:
+        yield artist, title          # original title + artist
+    # Title-only fallback (useful when artist name varies on the release)
+    if clean:
+        yield "", clean
+
+
 # ─── MusicBrainz Lookup ───────────────────────────────────────────────────────
 
-def lookup_label_musicbrainz(artist: str, title: str) -> str:
-    """
-    Search MusicBrainz for a recording matching artist + title.
-    Returns the first label name found, or '' if nothing useful comes back.
-    """
+def _mb_query(artist: str, title: str) -> str:
+    """Run a single MusicBrainz recording search and return a label or ''."""
     _rate_limit(_last_mb_call, MB_RATE_LIMIT)
 
     query_parts = []
@@ -105,7 +137,7 @@ def lookup_label_musicbrainz(artist: str, title: str) -> str:
     query = " AND ".join(query_parts)
     url = (
         "https://musicbrainz.org/ws/2/recording/?"
-        + urllib.parse.urlencode({"query": query, "fmt": "json", "limit": "3"})
+        + urllib.parse.urlencode({"query": query, "fmt": "json", "limit": "5"})
     )
 
     data = _http_get(url, {"User-Agent": MB_USER_AGENT, "Accept": "application/json"})
@@ -118,21 +150,28 @@ def lookup_label_musicbrainz(artist: str, title: str) -> str:
                 name = label_info.get("label", {}).get("name", "").strip()
                 if name and name.lower() not in ("self-released", "not on label"):
                     return name
+    return ""
 
+
+def lookup_label_musicbrainz(artist: str, title: str) -> str:
+    """
+    Search MusicBrainz with multiple query variants (clean title, feat-stripped,
+    title-only) to maximise hit rate on underground/newer DnB tracks.
+    """
+    for a, t in search_variants(artist, title):
+        label = _mb_query(a, t)
+        if label:
+            return label
     return ""
 
 
 # ─── Discogs Lookup ───────────────────────────────────────────────────────────
 
-def lookup_label_discogs(artist: str, title: str, token: str) -> str:
-    """
-    Search Discogs for a release matching artist + title.
-    Returns the first label name found, or '' on failure.
-    Requires a Discogs personal access token.
-    """
+def _dg_query(artist: str, title: str, token: str) -> str:
+    """Run a single Discogs search and return a label or ''."""
     _rate_limit(_last_dg_call, DISCOGS_RATE_LIMIT)
 
-    params = {"type": "release", "token": token, "per_page": "3"}
+    params = {"type": "release", "token": token, "per_page": "5"}
     if title:
         params["q"] = title
     if artist:
@@ -154,7 +193,18 @@ def lookup_label_discogs(artist: str, title: str, token: str) -> str:
         labels = result.get("label", [])
         if labels:
             return labels[0].strip()
+    return ""
 
+
+def lookup_label_discogs(artist: str, title: str, token: str) -> str:
+    """
+    Search Discogs with multiple query variants to improve hit rate.
+    Requires a Discogs personal access token.
+    """
+    for a, t in search_variants(artist, title):
+        label = _dg_query(a, t, token)
+        if label:
+            return label
     return ""
 
 
@@ -219,13 +269,8 @@ def _extract_beatport_label(data: dict) -> str:
     return ""
 
 
-def lookup_label_beatport(artist: str, title: str) -> str:
-    """
-    Search Beatport for a track matching artist + title.
-    Parses the __NEXT_DATA__ JSON blob embedded in the search page HTML.
-    No API key required.
-    Returns the label name, or '' if nothing is found.
-    """
+def _bp_query(artist: str, title: str) -> str:
+    """Run a single Beatport search and return a label or ''."""
     _rate_limit(_last_bp_call, BEATPORT_RATE_LIMIT)
 
     query = " ".join(filter(None, [artist, title])).strip()
@@ -251,6 +296,20 @@ def lookup_label_beatport(artist: str, title: str) -> str:
         return ""
 
     return _extract_beatport_label(data)
+
+
+def lookup_label_beatport(artist: str, title: str) -> str:
+    """
+    Search Beatport with multiple query variants to improve hit rate.
+    Tries clean title + artist first, then progressively broader queries.
+    Parses the __NEXT_DATA__ JSON embedded in Beatport's search page.
+    No API key required.
+    """
+    for a, t in search_variants(artist, title):
+        label = _bp_query(a, t)
+        if label:
+            return label
+    return ""
 
 
 # ─── Combined Online Lookup ───────────────────────────────────────────────────
