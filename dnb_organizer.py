@@ -239,13 +239,24 @@ def organize_library(source_dir: Path, dest_dir: Path) -> None:
 # ─── Entry Point ──────────────────────────────────────────────────────────────
 
 def prompt_directory(prompt_text: str) -> Path:
-    """Prompt the user for a directory path and validate it."""
+    """Prompt the user for a directory path and validate it.
+
+    Uses Path directly without resolve() so that UNC paths (\\NAS\share)
+    and mapped network drives work correctly on Windows.
+    """
     while True:
         raw = input(prompt_text).strip().strip('"').strip("'")
-        path = Path(raw).expanduser().resolve()
-        if path.is_dir():
-            return path
-        print(f"  ⚠  '{path}' is not a valid directory. Please try again.\n")
+        if not raw:
+            print("  ⚠  Please enter a path.\n")
+            continue
+        try:
+            path = Path(raw).expanduser()
+            if path.is_dir():
+                return path
+        except (OSError, ValueError):
+            pass
+        print(f"  ⚠  '{raw}' is not a valid directory. Please try again.\n")
+        print("       Tip: Use the full path, e.g.  P:\\Music  or  \\\\NAS\\Music\n")
 
 
 def main() -> None:
