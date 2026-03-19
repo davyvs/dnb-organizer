@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║          DnB Music Library Organizer  v1.4                   ║
+║          DnB Music Library Organizer  v1.2                   ║
 ║   Organizes MP3 / WAV / FLAC / M4A files by Label → Artist  ║
 ╚══════════════════════════════════════════════════════════════╝
 
@@ -13,10 +13,9 @@ Usage:
      and optionally a Discogs personal access token.)
 
 Online label lookup order (when tag is missing):
-    1. MusicBrainz   — free, no key needed
-    2. Beatport      — free, no key needed (parses search page JSON)
-    3. Rolldabeats   — free, no key needed (DnB-specific database)
-    4. Discogs       — free token required (discogs.com → Settings → Developers)
+    1. MusicBrainz  — free, no key needed
+    2. Beatport     — free, no key needed (parses search page JSON)
+    3. Discogs      — free token required (discogs.com → Settings → Developers)
 """
 
 import os
@@ -46,18 +45,16 @@ UNKNOWN_ARTIST = "_Unknown Artist"
 MB_RATE_LIMIT      = 1.1
 MB_USER_AGENT      = "dnb-organizer/1.2 ( https://github.com/davyvs/dnb-organizer )"
 
-DISCOGS_RATE_LIMIT      = 1.1
-BEATPORT_RATE_LIMIT     = 2.0   # be polite — no official API
-ROLLDABEATS_RATE_LIMIT  = 2.0   # be polite — no official API
+DISCOGS_RATE_LIMIT  = 1.1
+BEATPORT_RATE_LIMIT = 2.0   # be polite — no official API
 
 
 # ─── Online Lookup Cache & Rate Limiter ───────────────────────────────────────
 
-_label_cache: dict   = {}   # (artist, title) → label string
-_last_mb_call: list  = [0.0]
-_last_dg_call: list  = [0.0]
-_last_bp_call: list  = [0.0]
-_last_rdb_call: list = [0.0]
+_label_cache: dict  = {}   # (artist, title) → label string
+_last_mb_call: list = [0.0]
+_last_dg_call: list = [0.0]
+_last_bp_call: list = [0.0]
 
 
 def _rate_limit(last_call_ref: list, interval: float) -> None:
@@ -315,86 +312,6 @@ def lookup_label_beatport(artist: str, title: str) -> str:
     return ""
 
 
-# ─── Rolldabeats Lookup ───────────────────────────────────────────────────────
-
-_RDB_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Referer": "https://www.rolldabeats.com/",
-}
-
-# Label links on Rolldabeats follow /label/<slug>/ — capture the visible text
-_RDB_LABEL_LINK_RE = re.compile(
-    r'<a\s[^>]*href=["\'][^"\']*\/label\/[^"\']+["\'][^>]*>\s*([^<]+?)\s*<\/a>',
-    re.IGNORECASE,
-)
-# Fallback: plain-text "Label: Foo Records" pattern anywhere in the HTML
-_RDB_LABEL_TEXT_RE = re.compile(
-    r'(?:label|imprint)\s*[:\-]\s*([A-Za-z0-9][^<\n]{2,60}?)(?:<|\n|$)',
-    re.IGNORECASE,
-)
-
-
-def _extract_rolldabeats_label(html: str) -> str:
-    """
-    Parse a Rolldabeats search results page and return the first label name.
-
-    Strategy 1 — href-based: look for <a href="…/label/…">Label Name</a>
-    Strategy 2 — text-based: look for "Label: Foo Records" anywhere in the page
-    """
-    # Strategy 1: label links (most reliable)
-    for match in _RDB_LABEL_LINK_RE.finditer(html):
-        name = match.group(1).strip()
-        if name and len(name) > 1:
-            return name
-
-    # Strategy 2: plain-text label mentions
-    for match in _RDB_LABEL_TEXT_RE.finditer(html):
-        name = match.group(1).strip().rstrip(".,;")
-        if name and len(name) > 1:
-            return name
-
-    return ""
-
-
-def _rdb_query(artist: str, title: str) -> str:
-    """Run a single Rolldabeats search and return a label or ''."""
-    _rate_limit(_last_rdb_call, ROLLDABEATS_RATE_LIMIT)
-
-    query = " ".join(filter(None, [artist, title])).strip()
-    if not query:
-        return ""
-
-    url = (
-        "https://www.rolldabeats.com/search/?"
-        + urllib.parse.urlencode({"q": query})
-    )
-
-    html = _http_get_html(url, _RDB_HEADERS)
-    if not html:
-        return ""
-
-    return _extract_rolldabeats_label(html)
-
-
-def lookup_label_rolldabeats(artist: str, title: str) -> str:
-    """
-    Search Rolldabeats (DnB-specific database) for label info.
-    Tries multiple query variants for best coverage.
-    No API key required.
-    """
-    for a, t in search_variants(artist, title):
-        label = _rdb_query(a, t)
-        if label:
-            return label
-    return ""
-
-
 # ─── Combined Online Lookup ───────────────────────────────────────────────────
 
 def lookup_label_online(
@@ -402,14 +319,12 @@ def lookup_label_online(
     title: str,
     discogs_token: str = "",
     use_beatport: bool = True,
-    use_rolldabeats: bool = True,
 ) -> str:
     """
     Label lookup chain (stops as soon as a result is found):
-        1. MusicBrainz   — free, no key
-        2. Beatport      — free, no key (parses search page)
-        3. Rolldabeats   — free, no key (DnB-specific database)
-        4. Discogs       — free token required
+        1. MusicBrainz  — free, no key
+        2. Beatport     — free, no key (parses search page)
+        3. Discogs      — free token required
 
     Results are cached so the same (artist, title) is never looked up twice.
     Returns a label string, or '' if nothing is found.
@@ -434,14 +349,7 @@ def lookup_label_online(
         except Exception:
             label = ""
 
-    # 3 — Rolldabeats (DnB-specific — great for underground/smaller labels)
-    if not label and use_rolldabeats and (artist or title):
-        try:
-            label = lookup_label_rolldabeats(artist, title)
-        except Exception:
-            label = ""
-
-    # 4 — Discogs
+    # 3 — Discogs
     if not label and discogs_token and (artist or title):
         try:
             label = lookup_label_discogs(artist, title, discogs_token)
@@ -587,7 +495,6 @@ def organize_library(
     discogs_token: str = "",
     use_online: bool = True,
     use_beatport: bool = True,
-    use_rolldabeats: bool = True,
 ) -> None:
     """
     Walk `source_dir` recursively, read metadata from every supported audio
@@ -624,8 +531,7 @@ def organize_library(
             if not meta["label"] and use_online and (meta["artist"] or meta["title"]):
                 print("  🔍 looking up label…", end="", flush=True)
                 found = lookup_label_online(
-                    meta["artist"], meta["title"],
-                    discogs_token, use_beatport, use_rolldabeats
+                    meta["artist"], meta["title"], discogs_token, use_beatport
                 )
                 if found:
                     meta["label"] = found
@@ -694,7 +600,7 @@ def prompt_directory(prompt_text: str) -> Path:
 def main() -> None:
     print()
     print("╔══════════════════════════════════════════════════════════════╗")
-    print("║          DnB Music Library Organizer  v1.4                   ║")
+    print("║          DnB Music Library Organizer  v1.2                   ║")
     print("╚══════════════════════════════════════════════════════════════╝")
     print()
     print("  Supported formats : MP3 · WAV · FLAC · M4A · AIFF")
@@ -710,16 +616,12 @@ def main() -> None:
     use_online_raw = input("  Enable online lookup? [Y/n]  ").strip().lower()
     use_online = use_online_raw not in ("n", "no")
 
-    use_beatport    = False
-    use_rolldabeats = False
-    discogs_token   = ""
+    use_beatport  = False
+    discogs_token = ""
 
     if use_online:
-        bp_raw = input("  Enable Beatport lookup?     [Y/n]  ").strip().lower()
+        bp_raw = input("  Enable Beatport lookup? [Y/n]  ").strip().lower()
         use_beatport = bp_raw not in ("n", "no")
-
-        rdb_raw = input("  Enable Rolldabeats lookup?  [Y/n]  ").strip().lower()
-        use_rolldabeats = rdb_raw not in ("n", "no")
 
         print()
         print("  Discogs token (optional — press Enter to skip):")
@@ -730,8 +632,6 @@ def main() -> None:
         sources = ["MusicBrainz"]
         if use_beatport:
             sources.append("Beatport")
-        if use_rolldabeats:
-            sources.append("Rolldabeats")
         if discogs_token:
             sources.append("Discogs")
         print(f"  ✔  Online sources enabled: {' → '.join(sources)}")
@@ -752,10 +652,7 @@ def main() -> None:
         print("  Aborted.")
         return
 
-    organize_library(
-        source_dir, dest_dir,
-        discogs_token, use_online, use_beatport, use_rolldabeats
-    )
+    organize_library(source_dir, dest_dir, discogs_token, use_online, use_beatport)
 
 
 if __name__ == "__main__":
