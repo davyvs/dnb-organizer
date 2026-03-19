@@ -1,20 +1,26 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║          DnB Music Library Organizer  v1.0                   ║
+║          DnB Music Library Organizer  v1.1                   ║
 ║   Organizes MP3 / WAV / FLAC files by Label → Artist        ║
 ╚══════════════════════════════════════════════════════════════╝
 
 Dependencies:
-    pip install mutagen
+    pip install mutagen requests
 
 Usage:
     python dnb_organizer.py
-    (You will be prompted for Source and Destination directories.)
+    (You will be prompted for Source and Destination directories,
+     and optionally a Discogs personal access token.)
 """
 
 import os
 import re
+import json
+import time
 import shutil
+import urllib.request
+import urllib.parse
+import urllib.error
 from pathlib import Path
 
 from mutagen import File as MutagenFile
@@ -23,12 +29,148 @@ from mutagen.id3 import ID3NoHeaderError
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-SUPPORTED_EXTENSIONS = {".mp3", ".wav", ".flac"}
+SUPPORTED_EXTENSIONS = {".mp3", ".wav", ".flac", ".m4a", ".aiff", ".aif"}
 
 ILLEGAL_CHARS_RE = re.compile(r'[\\/:*?"<>|]')
 
 UNKNOWN_LABEL  = "_Unknown Label"
 UNKNOWN_ARTIST = "_Unknown Artist"
+
+# MusicBrainz requires at least 1 second between requests
+MB_RATE_LIMIT  = 1.1
+MB_USER_AGENT  = "dnb-organizer/1.1 ( https://github.com/davyvs/dnb-organizer )"
+
+DISCOGS_RATE_LIMIT = 1.1
+
+
+# ─── Online Lookup Cache & Rate Limiter ───────────────────────────────────────
+
+_label_cache: dict  = {}   # (artist, title) → label string
+_last_mb_call: list = [0.0]
+_last_dg_call: list = [0.0]
+
+
+def _rate_limit(last_call_ref: list, interval: float) -> None:
+    """Block until `interval` seconds have passed since the last call."""
+    elapsed = time.time() - last_call_ref[0]
+    if elapsed < interval:
+        time.sleep(interval - elapsed)
+    last_call_ref[0] = time.time()
+
+
+def _http_get(url: str, headers: dict) -> dict | None:
+    """Perform a GET request and return parsed JSON, or None on failure."""
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+# ─── MusicBrainz Lookup ───────────────────────────────────────────────────────
+
+def lookup_label_musicbrainz(artist: str, title: str) -> str:
+    """
+    Search MusicBrainz for a recording matching artist + title.
+    Returns the first label name found, or '' if nothing useful comes back.
+    """
+    _rate_limit(_last_mb_call, MB_RATE_LIMIT)
+
+    query_parts = []
+    if title:
+        query_parts.append(f'recording:"{title}"')
+    if artist:
+        query_parts.append(f'artist:"{artist}"')
+    if not query_parts:
+        return ""
+
+    query = " AND ".join(query_parts)
+    url = (
+        "https://musicbrainz.org/ws/2/recording/?"
+        + urllib.parse.urlencode({"query": query, "fmt": "json", "limit": "3"})
+    )
+
+    data = _http_get(url, {"User-Agent": MB_USER_AGENT, "Accept": "application/json"})
+    if not data:
+        return ""
+
+    for recording in data.get("recordings", []):
+        for release in recording.get("releases", []):
+            for label_info in release.get("label-info", []):
+                name = label_info.get("label", {}).get("name", "").strip()
+                if name and name.lower() not in ("self-released", "not on label"):
+                    return name
+
+    return ""
+
+
+# ─── Discogs Lookup ───────────────────────────────────────────────────────────
+
+def lookup_label_discogs(artist: str, title: str, token: str) -> str:
+    """
+    Search Discogs for a release matching artist + title.
+    Returns the first label name found, or '' on failure.
+    Requires a Discogs personal access token.
+    """
+    _rate_limit(_last_dg_call, DISCOGS_RATE_LIMIT)
+
+    params = {"type": "release", "token": token, "per_page": "3"}
+    if title:
+        params["q"] = title
+    if artist:
+        params["artist"] = artist
+
+    url = "https://api.discogs.com/database/search?" + urllib.parse.urlencode(params)
+
+    data = _http_get(
+        url,
+        {
+            "User-Agent": MB_USER_AGENT,
+            "Authorization": f"Discogs token={token}",
+        },
+    )
+    if not data:
+        return ""
+
+    for result in data.get("results", []):
+        labels = result.get("label", [])
+        if labels:
+            return labels[0].strip()
+
+    return ""
+
+
+# ─── Combined Online Lookup ───────────────────────────────────────────────────
+
+def lookup_label_online(artist: str, title: str, discogs_token: str = "") -> str:
+    """
+    Try MusicBrainz first, then Discogs (if a token is provided).
+    Results are cached so the same (artist, title) is never looked up twice.
+    Returns a label string, or '' if nothing is found.
+    """
+    cache_key = (artist.lower().strip(), title.lower().strip())
+    if cache_key in _label_cache:
+        return _label_cache[cache_key]
+
+    label = ""
+
+    # 1 — MusicBrainz (free, no key required)
+    if artist or title:
+        try:
+            label = lookup_label_musicbrainz(artist, title)
+        except Exception:
+            label = ""
+
+    # 2 — Discogs fallback
+    if not label and discogs_token and (artist or title):
+        try:
+            label = lookup_label_discogs(artist, title, discogs_token)
+        except Exception:
+            label = ""
+
+    _label_cache[cache_key] = label
+    return label
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -44,7 +186,7 @@ def sanitize(name: str) -> str:
 
 
 def title_case(name: str) -> str:
-    """Convert a string to Title Case, preserving all-caps acronyms (e.g. 'DJ')."""
+    """Convert a string to Title Case."""
     return name.title()
 
 
@@ -92,7 +234,6 @@ def extract_tag(audio, *keys: str) -> str:
             value = audio.get(key)
             if value is None:
                 continue
-            # ID3 frames expose .text; Vorbis comments return plain lists
             if hasattr(value, "text"):
                 text = " / ".join(str(v) for v in value.text if str(v).strip())
             elif isinstance(value, (list, tuple)):
@@ -118,64 +259,67 @@ def read_metadata(filepath: Path) -> dict:
         if audio is None:
             return result
 
-        # Artist  — ID3: TPE1 / easy: 'artist'
         result["artist"] = extract_tag(
             audio,
-            "artist",      # EasyID3 / EasyMP4 / Vorbis
-            "TPE1",        # Raw ID3
-            "©ART",        # MP4
+            "artist",                        # EasyID3 / EasyMP4 / Vorbis
+            "TPE1",                          # Raw ID3
+            "©ART",                          # Raw MP4
         )
-
-        # Label / Publisher  — ID3: TPUB / easy: 'organization' or 'label'
         result["label"] = extract_tag(
             audio,
-            "organization",  # EasyID3 maps TPUB here
-            "label",         # Vorbis comment (FLAC)
-            "publisher",     # Some taggers
-            "TPUB",          # Raw ID3
+            "organization",                  # EasyID3 → TPUB
+            "label",                         # Vorbis (FLAC)
+            "publisher",                     # Some taggers
+            "TPUB",                          # Raw ID3
+            "----:com.apple.iTunes:LABEL",   # iTunes M4A freeform atom
+            "----:com.apple.iTunes:label",
+            "----:com.apple.iTunes:Publisher",
+            "----:com.apple.iTunes:publisher",
         )
-
-        # Title  — used for the filename
         result["title"] = extract_tag(
             audio,
-            "title",   # EasyID3 / Vorbis
-            "TIT2",    # Raw ID3
-            "©nam",    # MP4
+            "title",                         # EasyID3 / EasyMP4 / Vorbis
+            "TIT2",                          # Raw ID3
+            "©nam",                          # Raw MP4
         )
 
     except (ID3NoHeaderError, Exception):
-        pass  # File has no tags — all fields stay empty
+        pass
 
     return result
 
 
-def build_filename(artist_folder: str, title: str, ext: str) -> str:
+def build_filename(artist_folder: str, title: str, ext: str) -> str | None:
     """
     Build the destination filename:  'Artist - Track Title.ext'
-    Falls back gracefully if title is missing.
+    Returns None if title is missing (caller uses original stem).
     """
     clean_title = sanitize(title).strip()
     if clean_title:
-        clean_title = title_case(clean_title)
-        return f"{artist_folder} - {clean_title}{ext}"
-    # No title tag: keep the original filename (already cleaned by caller)
-    return None  # Signal to caller to use original stem
+        return f"{artist_folder} - {title_case(clean_title)}{ext}"
+    return None
 
 
 # ─── Core Logic ───────────────────────────────────────────────────────────────
 
-def organize_library(source_dir: Path, dest_dir: Path) -> None:
+def organize_library(
+    source_dir: Path,
+    dest_dir: Path,
+    discogs_token: str = "",
+    use_online: bool = True,
+) -> None:
     """
     Walk `source_dir` recursively, read metadata from every supported audio
     file, and move it into:
         dest_dir / [Label] / [Artist] / [Artist] - [Title].ext
+
+    When the Label tag is empty, queries MusicBrainz (and optionally Discogs)
+    to fill it in before falling back to _Unknown Label.
     """
-    files_found   = 0
     files_moved   = 0
     files_skipped = 0
     errors        = []
 
-    # Collect all supported files first so progress is predictable
     all_files = [
         p for p in source_dir.rglob("*")
         if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
@@ -189,42 +333,49 @@ def organize_library(source_dir: Path, dest_dir: Path) -> None:
     print(f"\n  Found {total} audio file(s). Starting organisation…\n")
 
     for idx, filepath in enumerate(all_files, 1):
-        files_found += 1
         rel = filepath.relative_to(source_dir)
-        print(f"  [{idx}/{total}]  {rel}", end="  →  ", flush=True)
+        print(f"  [{idx}/{total}]  {rel}", end="", flush=True)
 
         try:
             meta = read_metadata(filepath)
+
+            # ── Online label lookup when tag is missing ───────────────────
+            if not meta["label"] and use_online and (meta["artist"] or meta["title"]):
+                print("  🔍 looking up label…", end="", flush=True)
+                found = lookup_label_online(
+                    meta["artist"], meta["title"], discogs_token
+                )
+                if found:
+                    meta["label"] = found
+                    print(f" found: {found}", end="", flush=True)
+                else:
+                    print("  not found", end="", flush=True)
+
+            print("  →  ", end="", flush=True)
 
             label_folder  = clean_folder_name(meta["label"],  UNKNOWN_LABEL)
             artist_folder = clean_folder_name(meta["artist"], UNKNOWN_ARTIST)
             ext           = filepath.suffix.lower()
 
-            # Build filename
             filename = build_filename(artist_folder, meta["title"], ext)
             if filename is None:
-                # No title tag: sanitise & Title-Case the original stem
                 original_stem = title_case(sanitize(filepath.stem))
                 filename = f"{original_stem}{ext}"
 
-            # Create target directory
             target_dir = dest_dir / label_folder / artist_folder
             target_dir.mkdir(parents=True, exist_ok=True)
 
-            # Resolve conflicts
             dest_file = unique_destination(target_dir / filename)
-
-            # Move the file
             shutil.move(str(filepath), dest_file)
             print(f"{dest_file.relative_to(dest_dir)}")
             files_moved += 1
 
         except Exception as exc:
-            print(f"ERROR — {exc}")
+            print(f"\n  ERROR — {exc}")
             errors.append((filepath, str(exc)))
             files_skipped += 1
 
-    # ── Summary ──────────────────────────────────────────────────────────────
+    # ── Summary ───────────────────────────────────────────────────────────
     print("\n" + "─" * 60)
     print(f"  ✔  Moved   : {files_moved}")
     print(f"  ✖  Skipped : {files_skipped}")
@@ -239,10 +390,9 @@ def organize_library(source_dir: Path, dest_dir: Path) -> None:
 # ─── Entry Point ──────────────────────────────────────────────────────────────
 
 def prompt_directory(prompt_text: str) -> Path:
-    """Prompt the user for a directory path and validate it.
-
-    Uses Path directly without resolve() so that UNC paths (\\NAS\share)
-    and mapped network drives work correctly on Windows.
+    """
+    Prompt for a directory path. Uses Path directly without resolve() so
+    that UNC paths (\\NAS\share) and mapped drives work on Windows.
     """
     while True:
         raw = input(prompt_text).strip().strip('"').strip("'")
@@ -262,25 +412,44 @@ def prompt_directory(prompt_text: str) -> Path:
 def main() -> None:
     print()
     print("╔══════════════════════════════════════════════════════════════╗")
-    print("║          DnB Music Library Organizer  v1.0                   ║")
+    print("║          DnB Music Library Organizer  v1.1                   ║")
     print("╚══════════════════════════════════════════════════════════════╝")
     print()
-    print("  Supported formats : MP3 · WAV · FLAC")
+    print("  Supported formats : MP3 · WAV · FLAC · M4A · AIFF")
     print("  Output structure  : [Label] / [Artist] / [Artist] - [Title].ext")
     print()
 
+    # ── Online lookup setup ───────────────────────────────────────────────
+    print("  ── Online label lookup (for files missing a Label tag) ──────")
+    print("  MusicBrainz will be tried automatically (free, no key needed).")
+    print()
+    print("  Discogs token (optional — press Enter to skip):")
+    print("  Get one free at: discogs.com → Settings → Developers")
+    discogs_token = input("  Discogs token: ").strip()
+    if discogs_token:
+        print("  ✔  Discogs enabled as fallback.")
+    else:
+        print("  ℹ  Discogs skipped — MusicBrainz only.")
+    print()
+
+    use_online_raw = input("  Enable online lookup? [Y/n]  ").strip().lower()
+    use_online = use_online_raw not in ("n", "no")
+    print()
+
+    # ── Directories ───────────────────────────────────────────────────────
     source_dir = prompt_directory("  Source directory (where your files are now):\n  > ")
     dest_dir   = prompt_directory("  Destination directory (where to put the organised files):\n  > ")
 
     print(f"\n  Source      : {source_dir}")
     print(f"  Destination : {dest_dir}")
+    print(f"  Online lookup: {'MusicBrainz' + (' + Discogs' if discogs_token else '')  if use_online else 'disabled'}")
 
     confirm = input("\n  Proceed? [y/N]  ").strip().lower()
     if confirm not in ("y", "yes"):
         print("  Aborted.")
         return
 
-    organize_library(source_dir, dest_dir)
+    organize_library(source_dir, dest_dir, discogs_token, use_online)
 
 
 if __name__ == "__main__":
