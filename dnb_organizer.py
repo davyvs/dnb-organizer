@@ -1,16 +1,21 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║          DnB Music Library Organizer  v1.1                   ║
-║   Organizes MP3 / WAV / FLAC files by Label → Artist        ║
+║          DnB Music Library Organizer  v1.2                   ║
+║   Organizes MP3 / WAV / FLAC / M4A files by Label → Artist  ║
 ╚══════════════════════════════════════════════════════════════╝
 
 Dependencies:
-    pip install mutagen requests
+    pip install mutagen
 
 Usage:
     python dnb_organizer.py
     (You will be prompted for Source and Destination directories,
      and optionally a Discogs personal access token.)
+
+Online label lookup order (when tag is missing):
+    1. MusicBrainz  — free, no key needed
+    2. Beatport     — free, no key needed (parses search page JSON)
+    3. Discogs      — free token required (discogs.com → Settings → Developers)
 """
 
 import os
@@ -37,10 +42,11 @@ UNKNOWN_LABEL  = "_Unknown Label"
 UNKNOWN_ARTIST = "_Unknown Artist"
 
 # MusicBrainz requires at least 1 second between requests
-MB_RATE_LIMIT  = 1.1
-MB_USER_AGENT  = "dnb-organizer/1.1 ( https://github.com/davyvs/dnb-organizer )"
+MB_RATE_LIMIT      = 1.1
+MB_USER_AGENT      = "dnb-organizer/1.2 ( https://github.com/davyvs/dnb-organizer )"
 
-DISCOGS_RATE_LIMIT = 1.1
+DISCOGS_RATE_LIMIT  = 1.1
+BEATPORT_RATE_LIMIT = 2.0   # be polite — no official API
 
 
 # ─── Online Lookup Cache & Rate Limiter ───────────────────────────────────────
@@ -48,6 +54,7 @@ DISCOGS_RATE_LIMIT = 1.1
 _label_cache: dict  = {}   # (artist, title) → label string
 _last_mb_call: list = [0.0]
 _last_dg_call: list = [0.0]
+_last_bp_call: list = [0.0]
 
 
 def _rate_limit(last_call_ref: list, interval: float) -> None:
@@ -66,6 +73,16 @@ def _http_get(url: str, headers: dict) -> dict | None:
             return json.loads(resp.read().decode("utf-8"))
     except Exception:
         return None
+
+
+def _http_get_html(url: str, headers: dict) -> str:
+    """Perform a GET request and return the raw HTML string, or '' on failure."""
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
 
 
 # ─── MusicBrainz Lookup ───────────────────────────────────────────────────────
@@ -141,11 +158,115 @@ def lookup_label_discogs(artist: str, title: str, token: str) -> str:
     return ""
 
 
+# ─── Beatport Lookup ──────────────────────────────────────────────────────────
+
+# Regex to pull the __NEXT_DATA__ JSON blob Beatport embeds in every page
+_NEXT_DATA_RE = re.compile(
+    r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
+    re.DOTALL,
+)
+
+_BEATPORT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+
+def _extract_beatport_label(data: dict) -> str:
+    """
+    Walk the nested __NEXT_DATA__ structure Beatport uses and return the
+    first label name found in the track search results.
+
+    Beatport's Next.js data nests results under:
+      props → pageProps → dehydratedState → queries → [*] → state → data → results
+    Each result may have a 'label' key with a 'name' field.
+    """
+    try:
+        queries = (
+            data.get("props", {})
+                .get("pageProps", {})
+                .get("dehydratedState", {})
+                .get("queries", [])
+        )
+        for query in queries:
+            results = (
+                query.get("state", {})
+                     .get("data", {})
+                     .get("results", [])
+            )
+            for result in results:
+                # Tracks have a direct 'label' dict
+                label = result.get("label", {})
+                if isinstance(label, dict):
+                    name = label.get("name", "").strip()
+                    if name:
+                        return name
+                # Some result shapes nest it under 'release'
+                release = result.get("release", {})
+                if isinstance(release, dict):
+                    label = release.get("label", {})
+                    if isinstance(label, dict):
+                        name = label.get("name", "").strip()
+                        if name:
+                            return name
+    except Exception:
+        pass
+    return ""
+
+
+def lookup_label_beatport(artist: str, title: str) -> str:
+    """
+    Search Beatport for a track matching artist + title.
+    Parses the __NEXT_DATA__ JSON blob embedded in the search page HTML.
+    No API key required.
+    Returns the label name, or '' if nothing is found.
+    """
+    _rate_limit(_last_bp_call, BEATPORT_RATE_LIMIT)
+
+    query = " ".join(filter(None, [artist, title])).strip()
+    if not query:
+        return ""
+
+    url = (
+        "https://www.beatport.com/search/tracks?"
+        + urllib.parse.urlencode({"q": query})
+    )
+
+    html = _http_get_html(url, _BEATPORT_HEADERS)
+    if not html:
+        return ""
+
+    match = _NEXT_DATA_RE.search(html)
+    if not match:
+        return ""
+
+    try:
+        data = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return ""
+
+    return _extract_beatport_label(data)
+
+
 # ─── Combined Online Lookup ───────────────────────────────────────────────────
 
-def lookup_label_online(artist: str, title: str, discogs_token: str = "") -> str:
+def lookup_label_online(
+    artist: str,
+    title: str,
+    discogs_token: str = "",
+    use_beatport: bool = True,
+) -> str:
     """
-    Try MusicBrainz first, then Discogs (if a token is provided).
+    Label lookup chain (stops as soon as a result is found):
+        1. MusicBrainz  — free, no key
+        2. Beatport     — free, no key (parses search page)
+        3. Discogs      — free token required
+
     Results are cached so the same (artist, title) is never looked up twice.
     Returns a label string, or '' if nothing is found.
     """
@@ -155,14 +276,21 @@ def lookup_label_online(artist: str, title: str, discogs_token: str = "") -> str
 
     label = ""
 
-    # 1 — MusicBrainz (free, no key required)
-    if artist or title:
+    # 1 — MusicBrainz
+    if not label and (artist or title):
         try:
             label = lookup_label_musicbrainz(artist, title)
         except Exception:
             label = ""
 
-    # 2 — Discogs fallback
+    # 2 — Beatport
+    if not label and use_beatport and (artist or title):
+        try:
+            label = lookup_label_beatport(artist, title)
+        except Exception:
+            label = ""
+
+    # 3 — Discogs
     if not label and discogs_token and (artist or title):
         try:
             label = lookup_label_discogs(artist, title, discogs_token)
@@ -307,6 +435,7 @@ def organize_library(
     dest_dir: Path,
     discogs_token: str = "",
     use_online: bool = True,
+    use_beatport: bool = True,
 ) -> None:
     """
     Walk `source_dir` recursively, read metadata from every supported audio
@@ -343,7 +472,7 @@ def organize_library(
             if not meta["label"] and use_online and (meta["artist"] or meta["title"]):
                 print("  🔍 looking up label…", end="", flush=True)
                 found = lookup_label_online(
-                    meta["artist"], meta["title"], discogs_token
+                    meta["artist"], meta["title"], discogs_token, use_beatport
                 )
                 if found:
                     meta["label"] = found
@@ -412,7 +541,7 @@ def prompt_directory(prompt_text: str) -> Path:
 def main() -> None:
     print()
     print("╔══════════════════════════════════════════════════════════════╗")
-    print("║          DnB Music Library Organizer  v1.1                   ║")
+    print("║          DnB Music Library Organizer  v1.2                   ║")
     print("╚══════════════════════════════════════════════════════════════╝")
     print()
     print("  Supported formats : MP3 · WAV · FLAC · M4A · AIFF")
@@ -421,19 +550,34 @@ def main() -> None:
 
     # ── Online lookup setup ───────────────────────────────────────────────
     print("  ── Online label lookup (for files missing a Label tag) ──────")
-    print("  MusicBrainz will be tried automatically (free, no key needed).")
-    print()
-    print("  Discogs token (optional — press Enter to skip):")
-    print("  Get one free at: discogs.com → Settings → Developers")
-    discogs_token = input("  Discogs token: ").strip()
-    if discogs_token:
-        print("  ✔  Discogs enabled as fallback.")
-    else:
-        print("  ℹ  Discogs skipped — MusicBrainz only.")
+    print("  Lookup order: MusicBrainz → Beatport → Discogs")
+    print("  MusicBrainz and Beatport are free with no key needed.")
     print()
 
     use_online_raw = input("  Enable online lookup? [Y/n]  ").strip().lower()
     use_online = use_online_raw not in ("n", "no")
+
+    use_beatport  = False
+    discogs_token = ""
+
+    if use_online:
+        bp_raw = input("  Enable Beatport lookup? [Y/n]  ").strip().lower()
+        use_beatport = bp_raw not in ("n", "no")
+
+        print()
+        print("  Discogs token (optional — press Enter to skip):")
+        print("  Get one free at: discogs.com → Settings → Developers")
+        discogs_token = input("  Discogs token: ").strip()
+
+        print()
+        sources = ["MusicBrainz"]
+        if use_beatport:
+            sources.append("Beatport")
+        if discogs_token:
+            sources.append("Discogs")
+        print(f"  ✔  Online sources enabled: {' → '.join(sources)}")
+    else:
+        print("  ℹ  Online lookup disabled.")
     print()
 
     # ── Directories ───────────────────────────────────────────────────────
@@ -449,7 +593,7 @@ def main() -> None:
         print("  Aborted.")
         return
 
-    organize_library(source_dir, dest_dir, discogs_token, use_online)
+    organize_library(source_dir, dest_dir, discogs_token, use_online, use_beatport)
 
 
 if __name__ == "__main__":
