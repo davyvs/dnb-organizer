@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║          DnB Music Library Organizer  v1.5                   ║
+║          DnB Music Library Organizer  v1.6                   ║
 ║   Organizes MP3 / WAV / FLAC / M4A files by Genre → Label   ║
 ╚══════════════════════════════════════════════════════════════╝
 
@@ -685,7 +685,7 @@ def prompt_directory(prompt_text: str) -> Path:
 def main() -> None:
     print()
     print("╔══════════════════════════════════════════════════════════════╗")
-    print("║          DnB Music Library Organizer  v1.5                   ║")
+    print("║          DnB Music Library Organizer  v1.6                   ║")
     print("╚══════════════════════════════════════════════════════════════╝")
     print()
     print("  Supported formats : MP3 · WAV · FLAC · M4A · AIFF")
