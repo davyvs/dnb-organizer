@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║       DnB Music Library Organizer — UI  v1.5                 ║
+║       DnB Music Library Organizer — UI  v1.7                 ║
 ╚══════════════════════════════════════════════════════════════╝
 
 Dependencies:
@@ -47,7 +47,7 @@ class DnBOrganizerApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("DnB Music Library Organizer  v1.5")
+        self.title("DnB Music Library Organizer  v1.7")
         self.geometry("720x740")
         self.minsize(620, 680)
         self.configure(fg_color=BG_DARK)
@@ -71,7 +71,7 @@ class DnBOrganizerApp(ctk.CTk):
         header.pack(fill="x")
         ctk.CTkLabel(
             header,
-            text="🎵  DnB Music Library Organizer",
+            text="🎵  DnB Music Library Organizer  v1.7",
             font=("Segoe UI", 17, "bold"),
             text_color=ACCENT,
         ).pack(pady=14)
@@ -313,8 +313,14 @@ class DnBOrganizerApp(ctk.CTk):
                 self._app = app
             def write(self, s):
                 if s.strip():
-                    self._q.put((s.rstrip(), "log"))
-                    # Detect progress by counting "→" lines
+                    # Colour-code special lines
+                    if "[BAD QUALITY" in s:
+                        self._q.put((s.rstrip(), "warning"))
+                    elif "[DUPLICATE" in s or "[UPGRADED" in s:
+                        self._q.put((s.rstrip(), "info"))
+                    else:
+                        self._q.put((s.rstrip(), "log"))
+                    # Count progress for any line that contains "→"
                     if "→" in s:
                         self._app._done += 1
                 return len(s)

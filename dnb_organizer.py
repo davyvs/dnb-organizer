@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║          DnB Music Library Organizer  v1.6                   ║
+║          DnB Music Library Organizer  v1.7                   ║
 ║   Organizes MP3 / WAV / FLAC / M4A files by Genre → Label   ║
 ╚══════════════════════════════════════════════════════════════╝
 
@@ -43,6 +43,28 @@ UNKNOWN_LABEL  = "_Unknown Label"
 UNKNOWN_ARTIST = "_Unknown Artist"
 UNKNOWN_GENRE  = "_Unknown Genre"
 DNB_ROOT       = "Drum And Bass"   # DnB sub-genre folders live under this
+DOUBLES_FOLDER     = "_Doubles"         # Duplicate tracks moved here
+BAD_QUALITY_FOLDER = "_Bad Quality Tracks"  # Low-bitrate files moved here
+
+# ─── Quality Settings ─────────────────────────────────────────────────────────
+
+# Format quality tiers — higher number = better quality.
+# Lossless formats (FLAC, WAV, AIFF) always outrank lossy ones.
+_FORMAT_TIER: dict[str, int] = {
+    ".flac": 4,
+    ".wav":  4,
+    ".aiff": 4,
+    ".aif":  4,
+    ".m4a":  3,
+    ".mp3":  2,
+}
+
+# Files of these formats are sent to BAD_QUALITY_FOLDER if their bitrate
+# is below the threshold (kbps).  Lossless formats are never bad-quality.
+BAD_QUALITY_KBPS: dict[str, int] = {
+    ".mp3": 192,
+    ".m4a": 128,
+}
 
 # DnB sub-genres that get nested under DNB_ROOT.
 # Deliberately excludes the top-level genre names ("drum and bass", "dnb" etc.)
@@ -59,6 +81,64 @@ _DNB_GENRES = {
 def is_dnb_genre(genre: str) -> bool:
     """Return True if the genre string is DnB or a DnB sub-genre."""
     return genre.lower().strip() in _DNB_GENRES
+
+
+# ─── Quality Helpers ──────────────────────────────────────────────────────────
+
+def get_quality(filepath: Path) -> tuple[int, int]:
+    """
+    Return (format_tier, bitrate_kbps) for quality comparison.
+    Higher values mean better quality.
+    Lossless formats get tier 4 and bitrate 9999 so they always win.
+    """
+    ext = filepath.suffix.lower()
+    tier = _FORMAT_TIER.get(ext, 1)
+    # Lossless — bitrate comparison is meaningless; give max score
+    if tier >= 4:
+        return (tier, 9999)
+    bitrate = 0
+    try:
+        audio = MutagenFile(filepath)
+        if audio and hasattr(audio, "info"):
+            raw = getattr(audio.info, "bitrate", 0)
+            bitrate = int(raw) // 1000 if raw else 0
+    except Exception:
+        pass
+    return (tier, bitrate)
+
+
+def is_bad_quality(filepath: Path) -> bool:
+    """
+    Return True if the file is below the quality threshold defined in
+    BAD_QUALITY_KBPS.  Lossless formats (WAV, FLAC, AIFF) are never bad.
+    Files whose bitrate cannot be read are not flagged.
+    """
+    ext = filepath.suffix.lower()
+    threshold = BAD_QUALITY_KBPS.get(ext)
+    if threshold is None:
+        return False  # Lossless or unrecognised — never bad quality
+    _, bitrate = get_quality(filepath)
+    return bitrate > 0 and bitrate < threshold
+
+
+def find_existing_track(target_dir: Path, canonical_stem: str) -> Path | None:
+    """
+    Look in target_dir for a file whose stem matches canonical_stem
+    (case-insensitive, any supported extension).
+    Returns the first match or None.
+    """
+    stem_lower = canonical_stem.lower()
+    try:
+        for existing in target_dir.iterdir():
+            if (
+                existing.is_file()
+                and existing.suffix.lower() in SUPPORTED_EXTENSIONS
+                and existing.stem.lower() == stem_lower
+            ):
+                return existing
+    except Exception:
+        pass
+    return None
 
 MB_RATE_LIMIT      = 1.1
 MB_USER_AGENT      = "dnb-organizer/1.5 ( https://github.com/davyvs/dnb-organizer )"
@@ -557,16 +637,28 @@ def organize_library(
     Walk source_dir recursively and move each audio file into:
         dest_dir / Drum And Bass / [Genre] / [Label] / [Artist] / [Artist] - [Title].ext
 
-    If an artist folder already exists anywhere in dest_dir, that existing
-    location is used instead of creating a new one — keeping all tracks for
-    an artist in one place regardless of genre/label changes.
+    Quality rules
+    -------------
+    • Files below the BAD_QUALITY_KBPS threshold are sent to
+      dest_dir / _Bad Quality Tracks  instead.
+    • If a track already exists at the target location:
+        - Incoming is better quality → old file moves to _Doubles, new
+          file takes its place.
+        - Incoming is same/worse quality → incoming goes to _Doubles.
+
+    Artist consolidation
+    --------------------
+    If an artist folder already exists anywhere in dest_dir, that exact
+    path is reused — keeping all tracks for an artist in one place.
 
     Missing label and genre tags are resolved via online lookup before
     falling back to _Unknown Label / _Unknown Genre.
     """
-    files_moved   = 0
-    files_skipped = 0
-    errors        = []
+    files_moved    = 0
+    files_skipped  = 0
+    files_doubled  = 0
+    files_badqual  = 0
+    errors         = []
 
     all_files = [
         p for p in source_dir.rglob("*")
@@ -627,26 +719,68 @@ def organize_library(
             if filename is None:
                 filename = f"{title_case(sanitize(filepath.stem))}{ext}"
 
+            canonical_stem = Path(filename).stem  # "Artist - Title" (no ext)
+
+            # ── Bad quality check ─────────────────────────────────────────
+            if is_bad_quality(filepath):
+                bad_dir = dest_dir / BAD_QUALITY_FOLDER
+                bad_dir.mkdir(parents=True, exist_ok=True)
+                dest_file = unique_destination(bad_dir / filename)
+                shutil.move(str(filepath), dest_file)
+                tier, kbps = get_quality(filepath)
+                print(f"[BAD QUALITY {kbps}kbps] → {dest_file.relative_to(dest_dir)}")
+                files_badqual += 1
+                continue
+
             # ── Artist consolidation ──────────────────────────────────────
-            # If this artist already has a folder in dest_dir, use it.
             artist_key = artist_folder.lower()
             if artist_key in artist_index:
                 target_dir = artist_index[artist_key]
             else:
-                # Build new path: DnB sub-genres nest under Drum And Bass root
                 if is_dnb_genre(meta.get("genre", "")):
                     target_dir = dest_dir / DNB_ROOT / genre_folder / label_folder / artist_folder
                 else:
                     target_dir = dest_dir / genre_folder / label_folder / artist_folder
-                # Register so subsequent tracks for this artist go here too
                 artist_index[artist_key] = target_dir
 
             target_dir.mkdir(parents=True, exist_ok=True)
 
-            dest_file = unique_destination(target_dir / filename)
-            shutil.move(str(filepath), dest_file)
-            print(f"{dest_file.relative_to(dest_dir)}")
-            files_moved += 1
+            # ── Duplicate / quality comparison ────────────────────────────
+            existing = find_existing_track(target_dir, canonical_stem)
+
+            if existing:
+                incoming_q = get_quality(filepath)
+                existing_q = get_quality(existing)
+
+                doubles_dir = dest_dir / DOUBLES_FOLDER
+                doubles_dir.mkdir(parents=True, exist_ok=True)
+
+                if incoming_q > existing_q:
+                    # New file is better — replace existing, send old to Doubles
+                    dupe_dest = unique_destination(doubles_dir / existing.name)
+                    shutil.move(str(existing), dupe_dest)
+                    shutil.move(str(filepath), existing)   # keep same path
+                    print(
+                        f"[UPGRADED {existing_q[0]}->{incoming_q[0]}, "
+                        f"{existing_q[1]}->{incoming_q[1]}kbps] "
+                        f"→ {existing.relative_to(dest_dir)}"
+                    )
+                    files_moved   += 1
+                    files_doubled += 1
+                else:
+                    # Existing is same or better — incoming goes to Doubles
+                    dest_file = unique_destination(doubles_dir / filename)
+                    shutil.move(str(filepath), dest_file)
+                    print(
+                        f"[DUPLICATE, kept existing {existing_q[1]}kbps] "
+                        f"→ {dest_file.relative_to(dest_dir)}"
+                    )
+                    files_doubled += 1
+            else:
+                dest_file = unique_destination(target_dir / filename)
+                shutil.move(str(filepath), dest_file)
+                print(f"{dest_file.relative_to(dest_dir)}")
+                files_moved += 1
 
         except Exception as exc:
             print(f"\n  ERROR — {exc}")
@@ -654,8 +788,10 @@ def organize_library(
             files_skipped += 1
 
     print("\n" + "─" * 60)
-    print(f"  ✔  Moved   : {files_moved}")
-    print(f"  ✖  Skipped : {files_skipped}")
+    print(f"  ✔  Organised     : {files_moved}")
+    print(f"  ♻  Duplicates    : {files_doubled}  (moved to {DOUBLES_FOLDER})")
+    print(f"  ⚡  Bad quality   : {files_badqual}  (moved to {BAD_QUALITY_FOLDER})")
+    print(f"  ✖  Errors        : {files_skipped}")
     if errors:
         print("\n  Files with errors:")
         for fp, msg in errors:
@@ -685,7 +821,7 @@ def prompt_directory(prompt_text: str) -> Path:
 def main() -> None:
     print()
     print("╔══════════════════════════════════════════════════════════════╗")
-    print("║          DnB Music Library Organizer  v1.6                   ║")
+    print("║          DnB Music Library Organizer  v1.7                   ║")
     print("╚══════════════════════════════════════════════════════════════╝")
     print()
     print("  Supported formats : MP3 · WAV · FLAC · M4A · AIFF")

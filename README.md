@@ -31,6 +31,12 @@ Drum And Bass/
     └── Ram Records/
         └── Voltage/
             └── Voltage - Black Mamba.m4a
+
+_Doubles/
+│   └── Voltage - Black Mamba.mp3       ← inferior copy moved here
+
+_Bad Quality Tracks/
+    └── SomeArtist - LowBitrate.mp3     ← below 192 kbps threshold
 ```
 
 **Artist consolidation** — if an artist folder already exists anywhere in the destination, all new tracks for that artist are placed there automatically, keeping every artist in one consistent location regardless of genre or label changes.
@@ -54,6 +60,14 @@ Drum And Bass/
 - Strips feat. credits before searching (`New Forever (feat. Samahra Eames)` → `New Forever`)
 - Tries multiple query variants per source (artist + title → title only) to maximise hit rate
 - Caches all results so the same track is never looked up twice
+
+**Quality management** *(new in v1.7)*
+- Detects duplicate tracks: if the same Artist + Title already exists at the target location, the two files are quality-compared
+  - Better file (higher format tier or bitrate) stays in the library
+  - Inferior copy moves to `_Doubles` — nothing is deleted
+- Bad quality detection: MP3 files below **192 kbps** and M4A files below **128 kbps** are moved to `_Bad Quality Tracks` automatically
+- Lossless formats (FLAC · WAV · AIFF) always outrank lossy ones regardless of bitrate
+- Thresholds are defined as `BAD_QUALITY_KBPS` in the script and are easy to adjust
 
 **File handling**
 - Supports **MP3 · WAV · FLAC · M4A · AIFF**
@@ -89,7 +103,7 @@ Requires Python 3.10+.
 python dnb_organizer_ui.py
 ```
 
-A dark-themed desktop window with folder pickers, toggles for each lookup source, a live progress bar, and a scrollable log.
+A dark-themed desktop window with folder pickers, toggles for each lookup source, a live progress bar, and a scrollable log. Duplicate and bad-quality lines are highlighted in distinct colours.
 
 ### Command line
 
@@ -138,5 +152,5 @@ Destination:  /Volumes/NAS/Music
 
 - Files are **moved**, not copied — no duplicate storage used
 - Safe to re-run — conflicts are resolved automatically with numbered suffixes
-- No files are ever deleted
+- No files are ever deleted — duplicates and bad-quality tracks are moved, not removed
 - Online lookup adds ~2s per track (Beatport rate limit) for files with missing tags — for large libraries, expect a longer runtime
