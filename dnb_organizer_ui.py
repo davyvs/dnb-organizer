@@ -151,7 +151,7 @@ class DnBOrganizerApp(ctk.CTk):
                      ).pack(anchor="w", padx=16, pady=(12, 2))
         ctk.CTkLabel(
             preview_frame,
-            text="[Genre]  /  [Label]  /  [Artist]  /  [Artist] - [Title].ext",
+            text="Drum And Bass  /  [Genre]  /  [Label]  /  [Artist]  /  [Artist] - [Title].ext",
             font=("Consolas", 12), text_color=ACCENT,
         ).pack(anchor="w", padx=16, pady=(0, 12))
 

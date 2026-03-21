@@ -9,26 +9,31 @@ Available as both a **command-line script** and a **desktop GUI**.
 ## Output structure
 
 ```
-[Genre] / [Label] / [Artist] / [Artist] - [Track Title].ext
+Drum And Bass / [Genre] / [Label] / [Artist] / [Artist] - [Track Title].ext
 ```
+
+DnB sub-genres are grouped under a single `Drum And Bass` root folder. Non-DnB genres (if any) stay at the top level.
 
 Example:
 ```
-Neurofunk/
-├── Prspct Recordings/
-│   ├── Deathmachine/
-│   │   └── Deathmachine - Photon Pain VIP.flac
-│   └── Neonlight/
-│       └── Neonlight - Orbit.flac
-Liquid/
-└── Hospital Records/
-    └── Logistics/
-        └── Logistics - Abandon The Machine.flac
-_Unknown Genre/
-└── Ram Records/
-    └── Voltage/
-        └── Voltage - Black Mamba.m4a
+Drum And Bass/
+├── Neurofunk/
+│   └── Prspct Recordings/
+│       ├── Deathmachine/
+│       │   └── Deathmachine - Photon Pain VIP.flac
+│       └── Neonlight/
+│           └── Neonlight - Orbit.flac
+├── Liquid/
+│   └── Hospital Records/
+│       └── Logistics/
+│           └── Logistics - Abandon The Machine.flac
+└── _Unknown Genre/
+    └── Ram Records/
+        └── Voltage/
+            └── Voltage - Black Mamba.m4a
 ```
+
+**Artist consolidation** — if an artist folder already exists anywhere in the destination, all new tracks for that artist are placed there automatically, keeping every artist in one consistent location regardless of genre or label changes.
 
 ---
 

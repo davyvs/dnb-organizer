@@ -42,6 +42,23 @@ ILLEGAL_CHARS_RE = re.compile(r'[\\/:*?"<>|]')
 UNKNOWN_LABEL  = "_Unknown Label"
 UNKNOWN_ARTIST = "_Unknown Artist"
 UNKNOWN_GENRE  = "_Unknown Genre"
+DNB_ROOT       = "Drum And Bass"   # DnB sub-genre folders live under this
+
+# DnB sub-genres that get nested under DNB_ROOT.
+# Deliberately excludes the top-level genre names ("drum and bass", "dnb" etc.)
+# to avoid creating "Drum And Bass / Drum And Bass / ..." paths.
+_DNB_GENRES = {
+    "neurofunk", "liquid", "liquid funk", "liquid dnb", "liquid drum and bass",
+    "jump up", "techstep", "darkstep", "crossbreed", "halftime",
+    "jungle", "drumfunk", "rollers", "deep rollers", "atmospheric",
+    "minimal", "deep liquid", "sambass", "ragga jungle", "hardstep",
+    "clownstep", "jazzstep", "technoid",
+}
+
+
+def is_dnb_genre(genre: str) -> bool:
+    """Return True if the genre string is DnB or a DnB sub-genre."""
+    return genre.lower().strip() in _DNB_GENRES
 
 MB_RATE_LIMIT      = 1.1
 MB_USER_AGENT      = "dnb-organizer/1.5 ( https://github.com/davyvs/dnb-organizer )"
@@ -498,6 +515,37 @@ def build_filename(artist_folder: str, title: str, ext: str) -> str | None:
 
 # ─── Core Logic ───────────────────────────────────────────────────────────────
 
+def build_artist_index(dest_dir: Path) -> dict:
+    """
+    Scan dest_dir for existing artist folders and return a lookup dict:
+        { artist_folder_name_lower → Path }
+
+    Structure assumed:  dest / DnB Root / Genre / Label / Artist
+    If an artist already exists anywhere in the tree, new tracks for that
+    artist are placed in their existing folder rather than a new one.
+    """
+    index = {}
+    try:
+        # Walk up to 4 levels deep to cover Drum And Bass / Genre / Label / Artist
+        for lvl1 in dest_dir.iterdir():
+            if not lvl1.is_dir():
+                continue
+            for lvl2 in lvl1.iterdir():
+                if not lvl2.is_dir():
+                    continue
+                for lvl3 in lvl2.iterdir():
+                    if not lvl3.is_dir():
+                        continue
+                    for lvl4 in lvl3.iterdir():
+                        if lvl4.is_dir():
+                            key = lvl4.name.lower().strip()
+                            if key not in index:
+                                index[key] = lvl4
+    except Exception:
+        pass
+    return index
+
+
 def organize_library(
     source_dir: Path,
     dest_dir: Path,
@@ -507,7 +555,11 @@ def organize_library(
 ) -> None:
     """
     Walk source_dir recursively and move each audio file into:
-        dest_dir / [Genre] / [Label] / [Artist] / [Artist] - [Title].ext
+        dest_dir / Drum And Bass / [Genre] / [Label] / [Artist] / [Artist] - [Title].ext
+
+    If an artist folder already exists anywhere in dest_dir, that existing
+    location is used instead of creating a new one — keeping all tracks for
+    an artist in one place regardless of genre/label changes.
 
     Missing label and genre tags are resolved via online lookup before
     falling back to _Unknown Label / _Unknown Genre.
@@ -526,7 +578,15 @@ def organize_library(
         print("\n⚠  No supported audio files found in the source directory.")
         return
 
-    print(f"\n  Found {total} audio file(s). Starting organisation…\n")
+    # Build index of existing artist folders so we can consolidate tracks
+    print("  Scanning destination for existing artist folders…", flush=True)
+    artist_index = build_artist_index(dest_dir)
+    if artist_index:
+        print(f"  Found {len(artist_index)} existing artist folder(s).\n")
+    else:
+        print("  No existing artist folders found — fresh destination.\n")
+
+    print(f"  Found {total} audio file(s). Starting organisation…\n")
 
     for idx, filepath in enumerate(all_files, 1):
         rel = filepath.relative_to(source_dir)
@@ -567,7 +627,20 @@ def organize_library(
             if filename is None:
                 filename = f"{title_case(sanitize(filepath.stem))}{ext}"
 
-            target_dir = dest_dir / genre_folder / label_folder / artist_folder
+            # ── Artist consolidation ──────────────────────────────────────
+            # If this artist already has a folder in dest_dir, use it.
+            artist_key = artist_folder.lower()
+            if artist_key in artist_index:
+                target_dir = artist_index[artist_key]
+            else:
+                # Build new path: DnB sub-genres nest under Drum And Bass root
+                if is_dnb_genre(meta.get("genre", "")):
+                    target_dir = dest_dir / DNB_ROOT / genre_folder / label_folder / artist_folder
+                else:
+                    target_dir = dest_dir / genre_folder / label_folder / artist_folder
+                # Register so subsequent tracks for this artist go here too
+                artist_index[artist_key] = target_dir
+
             target_dir.mkdir(parents=True, exist_ok=True)
 
             dest_file = unique_destination(target_dir / filename)
@@ -616,7 +689,7 @@ def main() -> None:
     print("╚══════════════════════════════════════════════════════════════╝")
     print()
     print("  Supported formats : MP3 · WAV · FLAC · M4A · AIFF")
-    print("  Output structure  : [Genre] / [Label] / [Artist] / [Artist] - [Title].ext")
+    print("  Output structure  : Drum And Bass / [Genre] / [Label] / [Artist] / [Artist] - [Title].ext")
     print()
 
     # ── Online lookup setup ───────────────────────────────────────────────
@@ -656,7 +729,7 @@ def main() -> None:
 
     print(f"\n  Source      : {source_dir}")
     print(f"  Destination : {dest_dir}")
-    print(f"  Structure   : Genre / Label / Artist / Track")
+    print(f"  Structure   : Drum And Bass / Genre / Label / Artist / Track")
 
     confirm = input("\n  Proceed? [y/N]  ").strip().lower()
     if confirm not in ("y", "yes"):
